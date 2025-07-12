@@ -35,6 +35,7 @@ class SampleStrategy(IStrategy):
 
     # Enable the position adjustment
     position_adjustment_enable = True
+    max_adjustments = 3
     # Example specific variables
     max_entry_position_adjustment = 5
 
@@ -96,10 +97,12 @@ class SampleStrategy(IStrategy):
     # Short exit hyperspace params:
     short_exit_params = {
         'short_low_offset': 0.964,
-        'short_dema_len_exit': 51
+        'short_dema_len_exit': 51,
+        'rsi_sell': 70
     }
 
     low_offset = DecimalParameter(0.80, 1.20, default=1.004, space='buy', optimize=True)
+    rsi_buy = IntParameter(30, 70, default=50, space='buy', optimize=True)
     high_offset = DecimalParameter(0.80, 1.20, default=0.964, space='sell', optimize=True)
     dema_len_buy = IntParameter(30, 90, default=72, space='buy', optimize=True)
     dema_len_sell = IntParameter(30, 90, default=51, space='sell', optimize=True)
@@ -108,6 +111,7 @@ class SampleStrategy(IStrategy):
     short_low_offset = DecimalParameter(0.80, 1.20, default=0.964, space='sell', optimize=True)
     short_dema_len_entry = IntParameter(30, 90, default=72, space='buy', optimize=True)
     short_dema_len_exit = IntParameter(30, 90, default=51, space='sell', optimize=True)
+    rsi_sell = IntParameter(30, 70, default=50, space='sell', optimize=True)
 
     def informative_pairs(self):
         try:
@@ -224,6 +228,9 @@ class SampleStrategy(IStrategy):
         dataframe.loc[(dataframe['bear_trend_over'] > 0), 'bear_trending'] = 0
         dataframe['bear_trending'] = dataframe['bear_trending'].ffill()
 
+        # RSI
+        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
+
         return dataframe
 
     def fast_tf_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -270,12 +277,14 @@ class SampleStrategy(IStrategy):
         dataframe.loc[
             (dataframe['ichimoku_valid'] > 0)
             & (dataframe['bear_trending'] == 0)
+            & (dataframe['rsi'] < self.rsi_buy.value)
             & (dataframe['close'] < (dataframe[dema_long] * self.low_offset.value))
             , 'enter_long'] = 1
         
         dataframe.loc[
             (dataframe['ichimoku_valid'] > 0)
             & (dataframe['trending'] == 0)
+            & (dataframe['rsi'] > self.rsi_sell.value)
             & (dataframe['close'] > (dataframe[dema_short] * self.short_high_offset.value))
             , 'enter_short'] = 1
         
@@ -287,10 +296,12 @@ class SampleStrategy(IStrategy):
         
         dataframe.loc[
             (dataframe['close'] > (dataframe[dema_long] * self.high_offset.value))
+            | (dataframe['rsi'] > 70)
             , 'exit_long'] = 1
         
         dataframe.loc[
             (dataframe['close'] < (dataframe[dema_short] * self.short_low_offset.value))
+            | (dataframe['rsi'] < 30)
             , 'exit_short'] = 1
         
         return dataframe
@@ -306,7 +317,15 @@ class SampleStrategy(IStrategy):
         Adjust trade position when current profit reaches -10% by averaging down or up.
         Positive values returned increase position, negative values decrease it.
         """
+        if not trade.is_open:
+            return None
 
+        count_of_adjustments = 0
+        if hasattr(trade, 'adjustments') and trade.adjustments:
+            count_of_adjustments = len(trade.adjustments)
+
+        if count_of_adjustments >= self.max_adjustments:
+            return None
         # Define the profit threshold for making an adjustment
         profit_threshold = -0.10  # 10% negative profit
 
@@ -328,7 +347,7 @@ class SampleStrategy(IStrategy):
                         additional_stake = min(min_stake, max_stake - current_stake_amount)
                     else:
                         return None, f"Cannot adjust: minimum stake of ${min_stake} exceeds maximum stake of ${max_stake}."
-
+                logger.info(f"Adjusting position for trade {trade.id}: adding {additional_stake} to stake.")
                 return additional_stake, 'adjust_negative_10%'
             except Exception as e:
                 logger.error(f"Failed to calculate additional stake: {str(e)}")
