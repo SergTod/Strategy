@@ -7,9 +7,6 @@ import freqtrade.vendor.qtpylib.indicators as qtpylib
 from datetime import datetime
 from typing import Optional
 from freqtrade.persistence import Trade
-from datetime import datetime
-from typing import Optional
-
 
 # --- Custom Helpers ---
 def ssl_atr(dataframe, length=7):
@@ -57,7 +54,7 @@ class SampleStrategytest(IStrategy):
     dema_len_buy = IntParameter(40, 80, default=64, space='buy', optimize=True)
     rsi_buy = IntParameter(40, 60, default=48, space='buy', optimize=True)
     high_offset = DecimalParameter(1.0, 1.05, default=1.04, space='sell', optimize=True)
-    dema_len_sell = IntParameter(80, 120, default=90, space='sell', optimize=True)
+    dema_len_sell = IntParameter(40, 80, default=45, space='sell', optimize=True)
     adx_threshold = IntParameter(20, 40, default=36, space='buy', optimize=True)
     bb_bw_filter = DecimalParameter(0.01, 0.05, default=0.019, space='buy', optimize=True)
 
@@ -86,8 +83,11 @@ class SampleStrategytest(IStrategy):
             ['tenkan_sen', 'kijun_sen', 'senkou_a', 'senkou_b']
         ].ffill().bfill().replace([np.inf, -np.inf], np.nan)
 
-        df['is_above_cloud'] = (df['close'] > df[['senkou_a', 'senkou_b']].max(axis=1))
-        df['is_below_cloud'] = (df['close'] < df[['senkou_a', 'senkou_b']].min(axis=1))
+        # Find these two lines in your code and add .astype(int) to the end of each.
+        df['is_above_cloud'] = (df['close'] > df[['senkou_a', 'senkou_b']].max(axis=1)).astype(int)
+        df['is_below_cloud'] = (df['close'] < df[['senkou_a', 'senkou_b']].min(axis=1)).astype(int)
+        # ---------------------------------------------------
+
         df['chop_index_1h'] = chopiness_index(df)
 
         return df
@@ -97,7 +97,6 @@ class SampleStrategytest(IStrategy):
         df['dema_buy'] = ta.DEMA(df, timeperiod=self.dema_len_buy.value)
         df['dema_sell'] = ta.DEMA(df, timeperiod=self.dema_len_sell.value)
         df['adx'] = ta.ADX(df)
-        # CORRECTED: from l_price to typical_price
         bb = qtpylib.bollinger_bands(qtpylib.typical_price(df), window=20, stds=2)
         df['bb_width'] = (bb['upper'] - bb['lower']) / bb['mid']
         df['atr'] = ta.ATR(df, timeperiod=14)
@@ -113,19 +112,12 @@ class SampleStrategytest(IStrategy):
         return df
 
     def populate_entry_trend(self, df: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-        """
-        This function contains all entry logic and required calculations.
-        """
         max_score = 5
         chop_ok = df.get('chop_index_1h', pd.Series(False, index=df.index)) < 40
 
-        # Time-based filter (assuming UTC timezone)
-        # Adjust hours if your data is in a different timezone
-        # Example for New York (UTC-4): is_liquid_time = ~df['hour'].isin([18, 19, 20, 21])
         df['hour'] = df['date'].dt.hour
         is_liquid_time = ~df['hour'].isin([22, 23, 0, 1])
 
-        # Volatility-based dynamic threshold
         volatility_factor = df['atr'] / df['atr'].rolling(50).mean().fillna(1)
         market_stress = df['rsi_1h'].rolling(10).std().fillna(0) > 10
         dynamic_threshold = np.where(
@@ -136,7 +128,6 @@ class SampleStrategytest(IStrategy):
             )
         )
 
-        # Enhanced volume confirmation
         min_volume_ok = df['volume'] > df['volume'].rolling(50).quantile(0.30)
         volume_surge = df['volume'] > df['volume'].rolling(20).mean() * 1.5
         volume_increasing = df['volume'] > df['volume'].shift(1)
@@ -164,9 +155,7 @@ class SampleStrategytest(IStrategy):
 
         pullback_entry_long = (
             (df['long_score'].shift(1) >= dynamic_threshold) &
-            (qtpylib.crossed_above(df['close'].shift(1), df['dema_buy'].shift(1))) &
-            (df['close'] > df['dema_buy']) &
-            (df['volume'] > 0)
+            (qtpylib.crossed_above(df['close'], df['dema_buy']))
         )
 
         breakout_entry_long = (
@@ -177,9 +166,7 @@ class SampleStrategytest(IStrategy):
 
         pullback_entry_short = (
             (df['short_score'].shift(1) >= dynamic_threshold) &
-            (qtpylib.crossed_below(df['close'].shift(1), df['dema_sell'].shift(1))) &
-            (df['close'] < df['dema_sell']) &
-            (df['volume'] > 0)
+            (qtpylib.crossed_below(df['close'], df['dema_sell']))
         )
 
         breakout_entry_short = (
@@ -209,9 +196,7 @@ class SampleStrategytest(IStrategy):
         return df
 
     def populate_exit_trend(self, df: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-        """
-        This function should only contain exit logic.
-        """
+
         # --- LONG EXITS ---
         df.loc[
             (
@@ -232,78 +217,52 @@ class SampleStrategytest(IStrategy):
 
     def custom_exit(self, pair: str, trade: 'Trade', current_time: datetime, current_rate: float,
                     current_profit: float, **kwargs) -> Optional[str]:
-        """
-        Applies custom exit rules based on trade-specific and live data.
-
-        - Rule 1: Dynamic profit target based on the entry signal strength.
-        - Rule 2: Emergency exit if the signal for the trade has severely deteriorated.
-
-        Returns:
-            A string with the reason for the exit, or None to continue the trade.
-        """
-        # Get the dataframe for the current pair and the latest candle
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         last_candle = dataframe.iloc[-1].squeeze()
 
-        # Safety check: Do not proceed if the dataframe is empty or invalid
         if last_candle is None:
             return None
 
-        # --- Rule 1: Dynamic ATR Profit Target ---
-        # CORRECTED: Retrieve from 'trade.custom_info' instead of 'trade.open_custom_info'
-        signal_strength = trade.custom_data.get('signal_strength', 0.5) if trade.custom_data else 0.5
-        atr_value = trade.custom_data.get('atr_at_entry', last_candle['atr'])
-
-        # Calculate a dynamic profit multiplier: stronger entry signals aim for larger profits.
-        # The multiplier scales from 3.0x (for weakest signals) to 5.0x (for strongest signals).
-        profit_multiplier = 3.0 + (signal_strength * 2.0)
+        custom_info = trade.custom_data if trade.custom_data else {}
+        signal_strength = custom_info.get('signal_strength', 0.5)
+        entry_atr = custom_info.get('entry_atr')
         
-        # Correctly calculate the profit target in terms of price offset
-        if trade.is_long:
-            profit_target = trade.open_rate + (atr_value * profit_multiplier)
-            if current_rate > profit_target:
-                return 'atr_profit_target_long'
-        elif trade.is_short:
-            profit_target = trade.open_rate - (atr_value * profit_multiplier)
-            if current_rate < profit_target:
-                return 'atr_profit_target_short'
+        if entry_atr is None or entry_atr == 0:
+            # Fallback to current ATR if not available in custom_data
+            atr_value = last_candle.get('atr', 0)
+        else:
+            atr_value = entry_atr
 
-        # --- Rule 2: Signal Deterioration Exit ---
-        # This is an "emergency exit" to protect capital if the market turns against the trade.
-        # This check is performed regardless of whether the trade is in profit or loss.
-        
-        # Get the *current* score for the direction of the trade
+        if atr_value > 0:
+            profit_multiplier = 3.0 + (signal_strength * 2.0)
+            if trade.is_long:
+                profit_target = trade.open_rate + (atr_value * profit_multiplier)
+                if current_rate > profit_target:
+                    return 'atr_profit_target_long'
+            elif trade.is_short:
+                profit_target = trade.open_rate - (atr_value * profit_multiplier)
+                if current_rate < profit_target:
+                    return 'atr_profit_target_short'
+
         if trade.is_long:
             current_score = last_candle.get('long_score', 0)
-        else:  # trade.is_short
+        else:
             current_score = last_candle.get('short_score', 0)
 
-        # If the score has dropped below a critical threshold (e.g., 2),
-        # it means the original reason for entry is no longer valid.
         if current_score < 2:
             return 'signal_deterioration_exit'
 
-        # If neither of the above custom exit conditions were met, return None.
         return None
 
-    def custom_data(self, pair: str, current_time: datetime, current_rate: float,
-                          proposed_stake: float, **kwargs) -> Optional[dict]:
-        """
-        Attaches custom data to the trade object at the time of entry.
+    def custom_entry_data(self, pair: str, current_time: datetime, current_rate: float,
+                                proposed_stake: float, **kwargs) -> Optional[dict]:
+            """
+            Attaches custom data to the trade object at the time of entry.
+            """
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            last_candle = dataframe.iloc[-1].squeeze()
 
-        This information is later accessible in custom_exit and other methods
-        via `trade.open_custom_info`.
-
-        Returns:
-            A dictionary containing the data to be stored with the trade.
-        """
-        # Get the dataframe for the current pair and the latest candle
-        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-        last_candle = dataframe.iloc[-1].squeeze()
-
-        # Return a dictionary with all the custom data you want to store.
-        # We store 'signal_strength' to use it later for our dynamic profit target.
-        return {
-            'signal_strength': last_candle.get('signal_strength', 0.5),
-            'atr_at_entry': last_candle.get('atr', 0.0)
-        }
+            return {
+                'signal_strength': last_candle.get('signal_strength', 0.5),
+                'entry_atr': last_candle.get('atr', 0.0)
+            }
