@@ -7,6 +7,7 @@ import freqtrade.vendor.qtpylib.indicators as qtpylib
 from datetime import datetime
 from typing import Optional
 from freqtrade.persistence import Trade
+from sqlalchemy.orm.exc import DetachedInstanceError
 
 # --- Custom Helpers ---
 def ssl_atr(dataframe, length=7):
@@ -41,22 +42,29 @@ class SampleStrategytest(IStrategy):
     startup_candle_count = 500
     process_only_new_candles = True
 
-    stoploss = -0.05
+    use_custom_entry_data = True
+
+    stoploss = -0.187
     position_adjustment_enable = False
 
-    minimal_roi = {"0": 10}
+    mminimal_roi = {
+        "0": 0.14,
+        "21": 0.069,
+        "68": 0.015,
+        "150": 0
+    }
     trailing_stop = True
-    trailing_stop_positive = 0.01
-    trailing_stop_positive_offset = 0.03
+    trailing_stop_positive = 0.307
+    trailing_stop_positive_offset = 0.326
     trailing_only_offset_is_reached = True
 
-    low_offset = DecimalParameter(0.95, 1.0, default=0.953, space='buy', optimize=True)
-    dema_len_buy = IntParameter(40, 80, default=64, space='buy', optimize=True)
-    rsi_buy = IntParameter(40, 60, default=48, space='buy', optimize=True)
-    high_offset = DecimalParameter(1.0, 1.05, default=1.04, space='sell', optimize=True)
-    dema_len_sell = IntParameter(40, 80, default=45, space='sell', optimize=True)
-    adx_threshold = IntParameter(20, 40, default=36, space='buy', optimize=True)
-    bb_bw_filter = DecimalParameter(0.01, 0.05, default=0.019, space='buy', optimize=True)
+    low_offset = DecimalParameter(0.95, 1.0, default=0.958, space='buy', optimize=True)
+    dema_len_buy = IntParameter(40, 80, default=47, space='buy', optimize=True)
+    rsi_buy = IntParameter(40, 60, default=44, space='buy', optimize=True)
+    high_offset = DecimalParameter(1.0, 1.05, default=1.022, space='sell', optimize=True)
+    dema_len_sell = IntParameter(40, 80, default=52, space='sell', optimize=True)
+    adx_threshold = IntParameter(20, 40, default=26, space='buy', optimize=True)
+    bb_bw_filter = DecimalParameter(0.01, 0.05, default=0.023, space='buy', optimize=True)
 
     def informative_pairs(self):
         pairs = self.dp.current_whitelist()
@@ -223,44 +231,51 @@ class SampleStrategytest(IStrategy):
         if last_candle is None:
             return None
 
-        signal_strength = trade.custom_data.get('signal_strength', 0.5)
-        entry_atr = trade.custom_data.get('entry_atr')
-        if entry_atr is None or entry_atr == 0:
-            # Fallback to current ATR if not available in custom_data
-            atr_value = last_candle.get('atr', 0)
-        else:
-            atr_value = entry_atr
+        # --- Defensive access to custom_data to avoid SQLAlchemy lazy load ---
+        custom_data = {}
+        if hasattr(trade, '__dict__') and 'custom_data' in trade.__dict__:
+            custom_data = trade.__dict__.get('custom_data') or {}
 
-        if atr_value > 0:
+        signal_strength = custom_data.get('signal_strength', 0.5)
+        entry_atr = custom_data.get('entry_atr') or last_candle.get('atr', 0)
+
+        is_long = getattr(trade, "direction", "").lower() == "long"
+        is_short = getattr(trade, "direction", "").lower() == "short"
+
+        if entry_atr > 0:
             profit_multiplier = 3.0 + (signal_strength * 2.0)
-            if trade.is_long:
-                profit_target = trade.open_rate + (atr_value * profit_multiplier)
+            if is_long:
+                profit_target = trade.open_rate + (entry_atr * profit_multiplier)
                 if current_rate > profit_target:
                     return 'atr_profit_target_long'
-            elif trade.is_short:
-                profit_target = trade.open_rate - (atr_value * profit_multiplier)
+            elif is_short:
+                profit_target = trade.open_rate - (entry_atr * profit_multiplier)
                 if current_rate < profit_target:
                     return 'atr_profit_target_short'
 
-        if trade.is_long:
-            current_score = last_candle.get('long_score', 0)
-        else:
-            current_score = last_candle.get('short_score', 0)
+        score_key = 'long_score' if is_long else 'short_score'
+        current_score = last_candle.get(score_key, 0)
 
         if current_score < 2:
             return 'signal_deterioration_exit'
+        print(f"[EXIT] {pair}: signal_strength={signal_strength}, ATR={entry_atr}, direction={'long' if is_long else 'short'}")
 
         return None
 
+
     def custom_entry_data(self, pair: str, current_time: datetime, current_rate: float,
                                 proposed_stake: float, **kwargs) -> Optional[dict]:
+            
             """
             Attaches custom data to the trade object at the time of entry.
             """
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
             last_candle = dataframe.iloc[-1].squeeze()
+            print(f"[DEBUG] Entry for {pair} at {current_time} — Signal: {last_candle.get('signal_strength')}, ATR: {last_candle.get('atr')}")
+
 
             return {
                 'signal_strength': last_candle.get('signal_strength', 0.5),
                 'entry_atr': last_candle.get('atr', 0.0)
             }
+    
