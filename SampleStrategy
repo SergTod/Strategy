@@ -84,10 +84,10 @@ class SampleStrategytest(IStrategy):
 
         df[['tenkan_sen', 'kijun_sen', 'senkou_a', 'senkou_b']] = df[
             ['tenkan_sen', 'kijun_sen', 'senkou_a', 'senkou_b']
-        ].ffill().bfill().replace([np.inf, -np.inf], np.nan).fillna(0)
+        ].ffill().bfill().replace([np.inf, -np.inf], np.nan)
 
-        df['is_above_cloud'] = (df['close'] > df[['senkou_a', 'senkou_b']].max(axis=1)).astype(int)
-        df['is_below_cloud'] = (df['close'] < df[['senkou_a', 'senkou_b']].min(axis=1)).astype(int)
+        df['is_above_cloud'] = (df['close'] > df[['senkou_a', 'senkou_b']].max(axis=1))
+        df['is_below_cloud'] = (df['close'] < df[['senkou_a', 'senkou_b']].min(axis=1))
         df['chop_index_1h'] = chopiness_index(df)
 
         return df
