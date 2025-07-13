@@ -223,10 +223,8 @@ class SampleStrategytest(IStrategy):
         if last_candle is None:
             return None
 
-        custom_info = trade.custom_data if trade.custom_data else {}
-        signal_strength = custom_info.get('signal_strength', 0.5)
-        entry_atr = custom_info.get('entry_atr')
-        
+        signal_strength = trade.custom_data.get('signal_strength', 0.5)
+        entry_atr = trade.custom_data.get('entry_atr')
         if entry_atr is None or entry_atr == 0:
             # Fallback to current ATR if not available in custom_data
             atr_value = last_candle.get('atr', 0)
