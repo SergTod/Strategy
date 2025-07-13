@@ -25,26 +25,31 @@
         # Calculate a dynamic profit multiplier: stronger entry signals aim for larger profits.
         # The multiplier scales from 3.0x (for weakest signals) to 5.0x (for strongest signals).
         profit_multiplier = 3.0 + (signal_strength * 2.0)
-        profit_target = (atr_value * profit_multiplier) / current_rate
 
-        # If the current profit has exceeded our dynamic target, exit the trade.
-        if current_profit > profit_target:
-            return 'atr_profit_target'
+        # Correctly calculate the profit target in terms of price offset
+        if trade.is_long:
+            profit_target = trade.open_rate + (atr_value * profit_multiplier)
+            if current_rate > profit_target:
+                return 'atr_profit_target_long'
+        elif trade.is_short:
+            profit_target = trade.open_rate - (atr_value * profit_multiplier)
+            if current_rate < profit_target:
+                return 'atr_profit_target_short'
 
         # --- Rule 2: Signal Deterioration Exit ---
-        # This is an "emergency exit" to protect profits if the market turns.
-        # Only check this if the trade is currently in profit.
-        if current_profit > 0:
-            # Get the *current* score for the direction of the trade
-            if trade.is_long:
-                current_score = last_candle.get('long_score', 0)
-            else: # trade.is_short
-                current_score = last_candle.get('short_score', 0)
+        # This is an "emergency exit" to protect capital if the market turns against the trade.
+        # This check is performed regardless of whether the trade is in profit or loss.
 
-            # If the score has dropped below a critical threshold (e.g., 2),
-            # it means the original reason for entry is no longer valid.
-            if current_score < 2:
-                return 'signal_deterioration_exit'
+        # Get the *current* score for the direction of the trade
+        if trade.is_long:
+            current_score = last_candle.get('long_score', 0)
+        else:  # trade.is_short
+            current_score = last_candle.get('short_score', 0)
+
+        # If the score has dropped below a critical threshold (e.g., 2),
+        # it means the original reason for entry is no longer valid.
+        if current_score < 2:
+            return 'signal_deterioration_exit'
 
         # If neither of the above custom exit conditions were met, return None.
         return None
