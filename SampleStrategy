@@ -7,6 +7,9 @@ import freqtrade.vendor.qtpylib.indicators as qtpylib
 from datetime import datetime
 from typing import Optional
 from freqtrade.persistence import Trade
+from datetime import datetime
+from typing import Optional
+
 
 # --- Custom Helpers ---
 def ssl_atr(dataframe, length=7):
@@ -246,7 +249,7 @@ class SampleStrategytest(IStrategy):
 
         # --- Rule 1: Dynamic ATR Profit Target ---
         # CORRECTED: Retrieve from 'trade.custom_info' instead of 'trade.open_custom_info'
-        signal_strength = trade.custom_info.get('signal_strength', 0.5) if trade.custom_info else 0.5
+        signal_strength = trade.custom_data.get('signal_strength', 0.5) if trade.custom_data else 0.5
         atr_value = last_candle['atr']
 
         # Calculate a dynamic profit multiplier: stronger entry signals aim for larger profits.
@@ -281,7 +284,7 @@ class SampleStrategytest(IStrategy):
         # If neither of the above custom exit conditions were met, return None.
         return None
 
-    def custom_trade_info(self, pair: str, current_time: datetime, current_rate: float,
+    def custom_data(self, pair: str, current_time: datetime, current_rate: float,
                           proposed_stake: float, **kwargs) -> Optional[dict]:
         """
         Attaches custom data to the trade object at the time of entry.
