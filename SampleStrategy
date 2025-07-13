@@ -18,8 +18,8 @@
             return None
 
         # --- Rule 1: Dynamic ATR Profit Target ---
-        # CORRECTED: Retrieve from 'trade.custom_info' instead of 'trade.open_custom_info'
-        signal_strength = trade.custom_info.get('signal_strength', 0.5) if trade.custom_info else 0.5
+        # CORRECTED: Retrieve from 'trade.open_custom_info' instead of 'trade.custom_info'
+        signal_strength = trade.open_custom_info.get('signal_strength', 0.5) if trade.open_custom_info else 0.5
         atr_value = last_candle['atr']
 
         # Calculate a dynamic profit multiplier: stronger entry signals aim for larger profits.
