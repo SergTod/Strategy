@@ -1,3 +1,230 @@
+# --- Do not remove these libs ---
+from freqtrade.strategy import IStrategy, merge_informative_pair, DecimalParameter, IntParameter
+import pandas as pd
+import numpy as np
+import talib.abstract as ta
+import freqtrade.vendor.qtpylib.indicators as qtpylib
+from datetime import datetime
+from typing import Optional
+from freqtrade.persistence import Trade
+
+# --- Custom Helpers ---
+def ssl_atr(dataframe, length=7):
+    df = dataframe.copy()
+    df['atr'] = ta.ATR(df, timeperiod=14)
+    df['smaHigh'] = df['high'].rolling(length).mean() + df['atr']
+    df['smaLow'] = df['low'].rolling(length).mean() - df['atr']
+    df['hlv'] = np.where(df['close'] > df['smaHigh'], 1, np.where(df['close'] < df['smaLow'], -1, np.NaN))
+    df['hlv'] = df['hlv'].ffill()
+    df['sslDown'] = np.where(df['hlv'] < 0, df['smaHigh'], df['smaLow'])
+    df['sslUp'] = np.where(df['hlv'] < 0, df['smaLow'], df['smaHigh'])
+    return df['sslDown'], df['sslUp']
+
+def chopiness_index(dataframe, period=14):
+    tr = ta.TRANGE(dataframe)
+    atr_sum = tr.rolling(window=period).sum()
+    high_max = dataframe['high'].rolling(window=period).max()
+    low_min = dataframe['low'].rolling(window=period).min()
+    chop = 100 * np.log10(atr_sum / (high_max - low_min)) / np.log10(period)
+    return chop
+
+def calculate_signal_strength(score: int, max_score: int) -> float:
+    if score < 0 or max_score <= 0:
+        return 0.0
+    return score / max_score
+
+class SampleStrategytest(IStrategy):
+
+    can_short = True
+    timeframe = '5m'
+    informative_timeframe = '1h'
+    startup_candle_count = 500
+    process_only_new_candles = True
+
+    stoploss = -0.05
+    position_adjustment_enable = False
+
+    minimal_roi = {"0": 10}
+    trailing_stop = True
+    trailing_stop_positive = 0.01
+    trailing_stop_positive_offset = 0.03
+    trailing_only_offset_is_reached = True
+
+    low_offset = DecimalParameter(0.95, 1.0, default=0.953, space='buy', optimize=True)
+    dema_len_buy = IntParameter(40, 80, default=64, space='buy', optimize=True)
+    rsi_buy = IntParameter(40, 60, default=48, space='buy', optimize=True)
+    high_offset = DecimalParameter(1.0, 1.05, default=1.04, space='sell', optimize=True)
+    dema_len_sell = IntParameter(40, 80, default=45, space='sell', optimize=True)
+    adx_threshold = IntParameter(20, 40, default=36, space='buy', optimize=True)
+    bb_bw_filter = DecimalParameter(0.01, 0.05, default=0.019, space='buy', optimize=True)
+
+    def informative_pairs(self):
+        pairs = self.dp.current_whitelist()
+        return [(pair, self.informative_timeframe) for pair in pairs]
+
+    def slow_tf_indicators(self, df: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+        df['rsi'] = ta.RSI(df, timeperiod=14)
+        macd = ta.MACD(df)
+        df['macd'] = macd['macd']
+        df['macdsignal'] = macd['macdsignal']
+        df['macd_is_bull'] = (df['macd'] > df['macdsignal']).astype('int')
+
+        ssl_down, ssl_up = ssl_atr(df, 10)
+        df['ssl_down'] = ssl_down
+        df['ssl_up'] = ssl_up
+        df['ssl_is_bull'] = (df['ssl_up'] > df['ssl_down']).astype('int')
+
+        df['tenkan_sen'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
+        df['kijun_sen'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
+        df['senkou_a'] = ((df['tenkan_sen'] + df['kijun_sen']) / 2).shift(26)
+        df['senkou_b'] = ((df['high'].rolling(52).max() + df['low'].rolling(52).min()) / 2).shift(26)
+
+        df[['tenkan_sen', 'kijun_sen', 'senkou_a', 'senkou_b']] = df[
+            ['tenkan_sen', 'kijun_sen', 'senkou_a', 'senkou_b']
+        ].ffill().bfill().replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        df['is_above_cloud'] = (df['close'] > df[['senkou_a', 'senkou_b']].max(axis=1)).astype(int)
+        df['is_below_cloud'] = (df['close'] < df[['senkou_a', 'senkou_b']].min(axis=1)).astype(int)
+        df['chop_index_1h'] = chopiness_index(df)
+
+        return df
+
+    def fast_tf_indicators(self, df: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+        df['rsi'] = ta.RSI(df, timeperiod=14)
+        df['dema_buy'] = ta.DEMA(df, timeperiod=self.dema_len_buy.value)
+        df['dema_sell'] = ta.DEMA(df, timeperiod=self.dema_len_sell.value)
+        df['adx'] = ta.ADX(df)
+        # CORRECTED: from l_price to typical_price
+        bb = qtpylib.bollinger_bands(qtpylib.typical_price(df), window=20, stds=2)
+        df['bb_width'] = (bb['upper'] - bb['lower']) / bb['mid']
+        df['atr'] = ta.ATR(df, timeperiod=14)
+        df['rolling_high_20'] = df['high'].rolling(20).max().shift(1)
+        df['rolling_low_20'] = df['low'].rolling(20).min().shift(1)
+        return df
+
+    def populate_indicators(self, df: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+        informative = self.dp.get_pair_dataframe(metadata['pair'], self.informative_timeframe)
+        informative = self.slow_tf_indicators(informative, metadata)
+        df = merge_informative_pair(df, informative, self.timeframe, self.informative_timeframe, ffill=True)
+        df = self.fast_tf_indicators(df, metadata)
+        return df
+
+    def populate_entry_trend(self, df: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+        """
+        This function contains all entry logic and required calculations.
+        """
+        max_score = 5
+        chop_ok = df.get('chop_index_1h', pd.Series(False, index=df.index)) < 40
+
+        # Time-based filter
+        df['hour'] = df['date'].dt.hour
+        is_liquid_time = ~df['hour'].isin([22, 23, 0, 1])
+
+        # Volatility-based dynamic threshold
+        volatility_factor = df['atr'] / df['atr'].rolling(50).mean().fillna(1)
+        market_stress = df['rsi_1h'].rolling(10).std().fillna(0) > 10
+        dynamic_threshold = np.where(
+            volatility_factor > 1.3, 5,
+            np.where(
+                (volatility_factor > 1.1) | market_stress, 4.5,
+                4
+            )
+        )
+
+        # Enhanced volume confirmation
+        min_volume_ok = df['volume'] > df['volume'].rolling(50).quantile(0.30)
+        volume_surge = df['volume'] > df['volume'].rolling(20).mean() * 1.5
+        volume_increasing = df['volume'] > df['volume'].shift(1)
+        volume_confirmation = volume_surge & volume_increasing & min_volume_ok
+
+        df['long_score'] = (
+            df['is_above_cloud_1h'].fillna(False).astype(int) +
+            df['ssl_is_bull_1h'].fillna(False).astype(int) +
+            df['macd_is_bull_1h'].fillna(False).astype(int) +
+            (df['rsi_1h'] > 50).fillna(False).astype(int) +
+            (df['adx'] > self.adx_threshold.value).fillna(False).astype(int)
+        )
+
+        df['short_score'] = (
+            df['is_below_cloud_1h'].fillna(False).astype(int) +
+            (df['ssl_is_bull_1h'] == 0).fillna(False).astype(int) +
+            (df['macd_is_bull_1h'] == 0).fillna(False).astype(int) +
+            (df['rsi_1h'] < 50).fillna(False).astype(int) +
+            (df['adx'] > self.adx_threshold.value).fillna(False).astype(int)
+        )
+
+        long_strength = df['long_score'].apply(lambda x: calculate_signal_strength(x, max_score))
+        short_strength = df['short_score'].apply(lambda x: calculate_signal_strength(x, max_score))
+        df['signal_strength'] = np.where(df['long_score'] > df['short_score'], long_strength, short_strength)
+
+        pullback_entry_long = (
+            (df['long_score'].shift(1) >= dynamic_threshold) &
+            (qtpylib.crossed_above(df['close'].shift(1), df['dema_buy'].shift(1))) &
+            (df['close'] > df['dema_buy']) &
+            (df['volume'] > 0)
+        )
+
+        breakout_entry_long = (
+            (df['long_score'].shift(1) >= dynamic_threshold) &
+            (df['close'] > df['rolling_high_20']) &
+            volume_confirmation
+        )
+
+        pullback_entry_short = (
+            (df['short_score'].shift(1) >= dynamic_threshold) &
+            (qtpylib.crossed_below(df['close'].shift(1), df['dema_sell'].shift(1))) &
+            (df['close'] < df['dema_sell']) &
+            (df['volume'] > 0)
+        )
+
+        breakout_entry_short = (
+            (df['short_score'].shift(1) >= dynamic_threshold) &
+            (df['close'] < df['rolling_low_20']) &
+            volume_confirmation
+        )
+
+        df.loc[
+            (
+                chop_ok &
+                is_liquid_time &
+                (df['bb_width'] > self.bb_bw_filter.value) &
+                (pullback_entry_long | breakout_entry_long)
+            ),
+            'enter_long'] = 1
+
+        df.loc[
+            (
+                chop_ok &
+                is_liquid_time &
+                (df['bb_width'] > self.bb_bw_filter.value) &
+                (pullback_entry_short | breakout_entry_short)
+            ),
+            'enter_short'] = 1
+
+        return df
+
+    def populate_exit_trend(self, df: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+        """
+        This function should only contain exit logic.
+        """
+        # --- LONG EXITS ---
+        df.loc[
+            (
+                (qtpylib.crossed_below(df['close'], df['dema_sell'] * self.high_offset.value)) |
+                (df['macd_is_bull_1h'] == 0)
+            ),
+            'exit_long'] = 1
+
+        # --- SHORT EXITS ---
+        df.loc[
+            (
+                (qtpylib.crossed_above(df['close'], df['dema_buy'] * self.low_offset.value)) |
+                (df['macd_is_bull_1h'] == 1)
+            ),
+            'exit_short'] = 1
+
+        return df
+
     def custom_exit(self, pair: str, trade: 'Trade', current_time: datetime, current_rate: float,
                     current_profit: float, **kwargs) -> Optional[str]:
         """
@@ -25,26 +252,52 @@
         # Calculate a dynamic profit multiplier: stronger entry signals aim for larger profits.
         # The multiplier scales from 3.0x (for weakest signals) to 5.0x (for strongest signals).
         profit_multiplier = 3.0 + (signal_strength * 2.0)
-        profit_target = (atr_value * profit_multiplier) / current_rate
-
-        # If the current profit has exceeded our dynamic target, exit the trade.
-        if current_profit > profit_target:
-            return 'atr_profit_target'
+        
+        # Correctly calculate the profit target in terms of price offset
+        if trade.is_long:
+            profit_target = trade.open_rate + (atr_value * profit_multiplier)
+            if current_rate > profit_target:
+                return 'atr_profit_target_long'
+        elif trade.is_short:
+            profit_target = trade.open_rate - (atr_value * profit_multiplier)
+            if current_rate < profit_target:
+                return 'atr_profit_target_short'
 
         # --- Rule 2: Signal Deterioration Exit ---
-        # This is an "emergency exit" to protect profits if the market turns.
-        # Only check this if the trade is currently in profit.
-        if current_profit > 0:
-            # Get the *current* score for the direction of the trade
-            if trade.is_long:
-                current_score = last_candle.get('long_score', 0)
-            else: # trade.is_short
-                current_score = last_candle.get('short_score', 0)
+        # This is an "emergency exit" to protect capital if the market turns against the trade.
+        # This check is performed regardless of whether the trade is in profit or loss.
+        
+        # Get the *current* score for the direction of the trade
+        if trade.is_long:
+            current_score = last_candle.get('long_score', 0)
+        else:  # trade.is_short
+            current_score = last_candle.get('short_score', 0)
 
-            # If the score has dropped below a critical threshold (e.g., 2),
-            # it means the original reason for entry is no longer valid.
-            if current_score < 2:
-                return 'signal_deterioration_exit'
+        # If the score has dropped below a critical threshold (e.g., 2),
+        # it means the original reason for entry is no longer valid.
+        if current_score < 2:
+            return 'signal_deterioration_exit'
 
         # If neither of the above custom exit conditions were met, return None.
         return None
+
+    def custom_trade_info(self, pair: str, current_time: datetime, current_rate: float,
+                          proposed_stake: float, **kwargs) -> Optional[dict]:
+        """
+        Attaches custom data to the trade object at the time of entry.
+
+        This information is later accessible in custom_exit and other methods
+        via `trade.open_custom_info`.
+
+        Returns:
+            A dictionary containing the data to be stored with the trade.
+        """
+        # Get the dataframe for the current pair and the latest candle
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        last_candle = dataframe.iloc[-1].squeeze()
+
+        # Return a dictionary with all the custom data you want to store.
+        # We store 'signal_strength' to use it later for our dynamic profit target.
+        return {
+            'signal_strength': last_candle.get('signal_strength', 0.5)
+        }
